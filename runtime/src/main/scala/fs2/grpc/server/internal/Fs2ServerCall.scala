@@ -21,6 +21,9 @@
 
 package fs2.grpc.server.internal
 
+import cats.effect.syntax.all.*
+import cats.syntax.all._
+import cats.effect.syntax.all._
 import cats.effect._
 import cats.effect.std.Dispatcher
 import fs2._
@@ -28,13 +31,13 @@ import fs2.grpc.server.ServerCallOptions
 import io.grpc._
 
 private[server] object Fs2ServerCall {
-  type Cancel = SyncIO[Unit]
+  type Cancel = Unit
 
-  def setup[I, O](
+  def setup[F[_]: Sync, I, O](
       options: ServerCallOptions,
       call: ServerCall[I, O]
-  ): SyncIO[Fs2ServerCall[I, O]] =
-    SyncIO {
+  ): F[Fs2ServerCall[I, O]] =
+    Sync[F].delay {
       call.setMessageCompression(options.messageCompression)
       options.compressor.map(_.name).foreach(call.setCompression)
       new Fs2ServerCall[I, O](call)
@@ -47,11 +50,11 @@ private[server] final class Fs2ServerCall[Request, Response](
 
   import Fs2ServerCall.Cancel
 
-  def stream[F[_]](
+  def stream[F[_]: Async](
       sendStream: Stream[F, Response] => Stream[F, Unit],
       response: Stream[F, Response],
       dispatcher: Dispatcher[F]
-  )(implicit F: Sync[F]): SyncIO[Cancel] =
+  ): F[Cancel] =
     run(
       response.pull.peek1
         .flatMap {
@@ -68,37 +71,39 @@ private[server] final class Fs2ServerCall[Request, Response](
       dispatcher
     )
 
-  def unary[F[_]](response: F[Response], dispatcher: Dispatcher[F])(implicit F: Sync[F]): SyncIO[Cancel] =
+  def unary[F[_]: Async](response: F[Response], dispatcher: Dispatcher[F]): F[Cancel] = {
     run(
-      F.map(response) { message =>
-        call.sendHeaders(new Metadata())
-        call.sendMessage(message)
-      },
+      response
+        .flatMap { message =>
+          Sync[F].delay {
+            call.sendHeaders(new Metadata())
+            call.sendMessage(message)
+          }
+        },
       dispatcher
     )
-
-  def request(n: Int): SyncIO[Unit] =
-    SyncIO(call.request(n))
-
-  def close(status: Status, metadata: Metadata): SyncIO[Unit] =
-    SyncIO(call.close(status, metadata))
-
-  private def run[F[_]](completed: F[Unit], dispatcher: Dispatcher[F])(implicit F: Sync[F]): SyncIO[Cancel] = {
-    SyncIO {
-      val cancel = dispatcher.unsafeRunCancelable(
-        F.handleError {
-          F.guaranteeCase(completed) {
-            case Outcome.Succeeded(_) => close(Status.OK, new Metadata()).to[F]
-            case Outcome.Errored(e) => handleError(e).to[F]
-            case Outcome.Canceled() => close(Status.CANCELLED, new Metadata()).to[F]
-          }
-        }(_ => ())
-      )
-      SyncIO(cancel()).void
-    }
   }
 
-  private def handleError(t: Throwable): SyncIO[Unit] = t match {
+  def request[F[_]: Sync](n: Int): F[Unit] =
+    Sync[F].delay(call.request(n))
+
+  def close[F[_]: Sync](status: Status, metadata: Metadata): F[Unit] =
+    Sync[F].delay(call.close(status, metadata))
+
+  private def run[F[_]: Async](completed: F[Unit], dispatcher: Dispatcher[F]): F[Cancel] = {
+    completed
+      .flatTap(_ => Sync[F].delay(println("Potentially poggers")))
+      .guaranteeCase {
+        case Outcome.Succeeded(_) => Sync[F].delay(println(">>>>>>>>>>>>>> Success")) >> close(Status.OK, new Metadata())
+        case Outcome.Errored(e) => Sync[F].delay(println(s">>>>>>>>>>>> Error $e")) >> handleError(e)
+        case Outcome.Canceled() => Sync[F].delay(println(">>>>>>>>>>>>>> Canceled")) >> close(Status.CANCELLED, new Metadata())
+      }
+      .handleError(_ => ())
+      .start
+      .void
+  }
+
+  private def handleError[F[_]: Sync](t: Throwable): F[Unit] = t match {
     case ex: StatusException => close(ex.getStatus, Option(ex.getTrailers).getOrElse(new Metadata()))
     case ex: StatusRuntimeException => close(ex.getStatus, Option(ex.getTrailers).getOrElse(new Metadata()))
     case ex => close(Status.INTERNAL.withDescription(ex.getMessage).withCause(ex), new Metadata())

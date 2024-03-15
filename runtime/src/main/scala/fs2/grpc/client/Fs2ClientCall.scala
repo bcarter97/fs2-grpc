@@ -23,12 +23,13 @@ package fs2
 package grpc
 package client
 
+import cats.effect.Sync
 import cats.effect.std.Dispatcher
-import cats.effect.{Async, Resource, SyncIO}
-import cats.syntax.all._
+import cats.effect.{Async, Resource}
+import cats.syntax.all.*
 import fs2.grpc.client.internal.Fs2UnaryCallHandler
 import fs2.grpc.shared.StreamOutput
-import io.grpc._
+import io.grpc.*
 
 final case class UnaryResult[A](value: Option[A], status: Option[GrpcStatus])
 final case class GrpcStatus(status: Status, trailers: Metadata)
@@ -61,7 +62,7 @@ class Fs2ClientCall[F[_], Request, Response] private[client] (
   //
 
   def unaryToUnaryCall(message: Request, headers: Metadata): F[Response] =
-    Fs2UnaryCallHandler.unary(call, options, message, headers)
+    Fs2UnaryCallHandler.unary(dispatcher, call, options, message, headers)
 
   def streamingToUnaryCall(messages: Stream[F, Request], headers: Metadata): F[Response] =
     StreamOutput.client(call).flatMap { output =>
@@ -70,12 +71,12 @@ class Fs2ClientCall[F[_], Request, Response] private[client] (
 
   def unaryToStreamingCall(message: Request, md: Metadata): Stream[F, Response] =
     Stream
-      .resource(mkStreamListenerR(md, SyncIO.unit))
+      .resource(mkStreamListenerR(md, Sync[F].unit))
       .flatMap(Stream.exec(sendSingleMessage(message)) ++ _.stream.adaptError(ea))
 
   def streamingToStreamingCall(messages: Stream[F, Request], md: Metadata): Stream[F, Response] = {
     val listenerAndOutput = Resource.eval(StreamOutput.client(call)).flatMap { output =>
-      mkStreamListenerR(md, output.onReadySync(dispatcher)).map((_, output))
+      mkStreamListenerR(md, output.onReady).map((_, output))
     }
 
     Stream
@@ -97,7 +98,7 @@ class Fs2ClientCall[F[_], Request, Response] private[client] (
 
   private def mkStreamListenerR(
       md: Metadata,
-      signalReadiness: SyncIO[Unit]
+      signalReadiness: F[Unit]
   ): Resource[F, Fs2StreamClientCallListener[F, Response]] = {
     val prefetchN = options.prefetchN.max(1)
     val create = Fs2StreamClientCallListener.create[F, Response](request, signalReadiness, dispatcher, prefetchN)

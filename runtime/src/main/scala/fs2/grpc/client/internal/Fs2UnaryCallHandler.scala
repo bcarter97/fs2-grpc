@@ -24,7 +24,7 @@ package fs2.grpc.client.internal
 import cats.effect.kernel.{Async, Outcome, Ref}
 import cats.effect.std.Dispatcher
 import cats.effect.syntax.all._
-import cats.effect.{Sync, SyncIO}
+import cats.effect.{Sync}
 import cats.syntax.flatMap._
 import cats.syntax.functor._
 import cats.syntax.applicativeError._
@@ -40,89 +40,97 @@ private[client] object Fs2UnaryCallHandler {
     def init[F[_]: Sync, R](
         callback: Either[Throwable, R] => Unit,
         pf: PartialFunction[StatusRuntimeException, Exception]
-    ): F[Ref[SyncIO, ReceiveState[R]]] =
-      Ref.in(new PendingMessage[R]({
+    ): F[Ref[F, ReceiveState[R]]] =
+      Ref.in(new PendingMessage[F, R]({
         case r: Right[Throwable, R] => callback(r)
         case Left(e: StatusRuntimeException) => callback(Left(pf.lift(e).getOrElse(e)))
         case l: Left[Throwable, R] => callback(l)
       }))
   }
 
-  class PendingMessage[R](callback: Either[Throwable, R] => Unit) extends ReceiveState[R] {
-    def receive(message: R): PendingHalfClose[R] = new PendingHalfClose(callback, message)
+  class PendingMessage[F[_]: Sync, R](callback: Either[Throwable, R] => Unit) extends ReceiveState[R] {
+    def receive(message: R): PendingHalfClose[F, R] = new PendingHalfClose(callback, message)
 
-    def sendError(error: Throwable): SyncIO[ReceiveState[R]] =
-      SyncIO(callback(Left(error))).as(new Done[R])
+    def sendError(error: Throwable): F[ReceiveState[R]] =
+      Sync[F].delay(callback(Left(error))).as(new Done[R])
   }
 
-  class PendingHalfClose[R](callback: Either[Throwable, R] => Unit, message: R) extends ReceiveState[R] {
-    def sendError(error: Throwable): SyncIO[ReceiveState[R]] =
-      SyncIO(callback(Left(error))).as(new Done[R])
+  class PendingHalfClose[F[_]: Sync, R](callback: Either[Throwable, R] => Unit, message: R) extends ReceiveState[R] {
+    def sendError(error: Throwable): F[ReceiveState[R]] =
+      Sync[F].delay(callback(Left(error))).as(new Done[R])
 
-    def done: SyncIO[ReceiveState[R]] = SyncIO(callback(Right(message))).as(new Done[R])
+    def done: F[ReceiveState[R]] = Sync[F].delay(callback(Right(message))).as(new Done[R])
   }
 
   class Done[R] extends ReceiveState[R]
 
-  private def mkListener[Response](
-      state: Ref[SyncIO, ReceiveState[Response]],
-      signalReadiness: SyncIO[Unit]
+  private def mkListener[F[_]: Sync, Response](
+      dispatcher: Dispatcher[F],
+      state: Ref[F, ReceiveState[Response]],
+      signalReadiness: F[Unit]
   ): ClientCall.Listener[Response] =
     new ClientCall.Listener[Response] {
-      override def onMessage(message: Response): Unit =
-        state.get
-          .flatMap {
-            case expected: PendingMessage[Response] =>
-              state.set(expected.receive(message))
-            case current: PendingHalfClose[Response] =>
-              current
-                .sendError(
-                  Status.INTERNAL
-                    .withDescription("More than one value received for unary call")
-                    .asRuntimeException()
-                )
-                .flatMap(state.set)
-            case _ => SyncIO.unit
-          }
-          .unsafeRunSync()
+      override def onMessage(message: Response): Unit = {
+        dispatcher.unsafeRunSync(
+          state.get
+            .flatMap {
+              case expected: PendingMessage[F, Response] =>
+                state.set(expected.receive(message))
+
+              case current: PendingHalfClose[F, Response] =>
+                current
+                  .sendError(
+                    Status.INTERNAL
+                      .withDescription("More than one value received for unary call")
+                      .asRuntimeException()
+                  )
+                  .flatMap(state.set)
+
+              case _ => Sync[F].unit
+            }
+        )
+      }
 
       override def onClose(status: Status, trailers: Metadata): Unit = {
-        if (status.isOk) {
-          state.get.flatMap {
-            case expected: PendingHalfClose[Response] =>
-              expected.done.flatMap(state.set)
-            case current: PendingMessage[Response] =>
-              current
-                .sendError(
-                  Status.INTERNAL
-                    .withDescription("No value received for unary call")
-                    .asRuntimeException(trailers)
-                )
-                .flatMap(state.set)
-            case _ => SyncIO.unit
+        dispatcher.unsafeRunSync(
+          if (status.isOk) {
+            state.get.flatMap {
+              case expected: PendingHalfClose[F, Response] =>
+                expected.done.flatMap(state.set)
+              case current: PendingMessage[F, Response] =>
+                current
+                  .sendError(
+                    Status.INTERNAL
+                      .withDescription("No value received for unary call")
+                      .asRuntimeException(trailers)
+                  )
+                  .flatMap(state.set)
+              case _ => Sync[F].unit
+            }
+          } else {
+            state.get.flatMap {
+              case current: PendingHalfClose[F, Response] =>
+                current.sendError(status.asRuntimeException(trailers)).flatMap(state.set)
+              case current: PendingMessage[F, Response] =>
+                current.sendError(status.asRuntimeException(trailers)).flatMap(state.set)
+              case _ => Sync[F].unit
+            }
           }
-        } else {
-          state.get.flatMap {
-            case current: PendingHalfClose[Response] =>
-              current.sendError(status.asRuntimeException(trailers)).flatMap(state.set)
-            case current: PendingMessage[Response] =>
-              current.sendError(status.asRuntimeException(trailers)).flatMap(state.set)
-            case _ => SyncIO.unit
-          }
-        }
-      }.unsafeRunSync()
+        )
+      }
 
-      override def onReady(): Unit = signalReadiness.unsafeRunSync()
+      override def onReady(): Unit = dispatcher.unsafeRunSync(signalReadiness)
     }
 
-  def unary[F[_], Request, Response](
+  def unary[F[_]: Async, Request, Response](
+      dispatcher: Dispatcher[F],
       call: ClientCall[Request, Response],
       options: ClientOptions,
       message: Request,
       headers: Metadata
-  )(implicit F: Async[F]): F[Response] = F.async[Response] { cb =>
+  ): F[Response] = Async[F].async[Response] { cb =>
     ReceiveState.init(cb, options.errorAdapter).map { state =>
-      call.start(mkListener[Response](state, SyncIO.unit), headers)
+      call.start(mkListener[F, Response](dispatcher, state, Sync[F].unit), headers)
       // Initially ask for two responses from flow-control so that if a misbehaving server
       // sends more than one responses, we can catch it and fail it in the listener.
       call.request(2)
@@ -132,16 +140,16 @@ private[client] object Fs2UnaryCallHandler {
     }
   }
 
-  def stream[F[_], Request, Response](
+  def stream[F[_]: Async, Request, Response](
       call: ClientCall[Request, Response],
       options: ClientOptions,
       dispatcher: Dispatcher[F],
       messages: Stream[F, Request],
       output: StreamOutput[F, Request],
       headers: Metadata
-  )(implicit F: Async[F]): F[Response] = F.async[Response] { cb =>
+  ): F[Response] = Async[F].async[Response] { cb =>
     ReceiveState.init(cb, options.errorAdapter).flatMap { state =>
-      call.start(mkListener[Response](state, output.onReadySync(dispatcher)), headers)
+      call.start(mkListener[F, Response](dispatcher, state, output.onReady), headers)
       // Initially ask for two responses from flow-control so that if a misbehaving server
       // sends more than one responses, we can catch it and fail it in the listener.
       call.request(2)
@@ -150,8 +158,8 @@ private[client] object Fs2UnaryCallHandler {
         .compile
         .drain
         .guaranteeCase {
-          case Outcome.Succeeded(_) => F.delay(call.halfClose())
-          case Outcome.Errored(e) => F.delay(call.cancel(e.getMessage, e))
+          case Outcome.Succeeded(_) => Async[F].delay(call.halfClose())
+          case Outcome.Errored(e) => Async[F].delay(call.cancel(e.getMessage, e))
           case Outcome.Canceled() => onCancel(call)
         }
         .handleError(_ => ())
@@ -160,7 +168,7 @@ private[client] object Fs2UnaryCallHandler {
     }
   }
 
-  private def onCancel[F[_]](call: ClientCall[_, _])(implicit F: Async[F]): F[Unit] =
+  private def onCancel[F[_]](call: ClientCall[_, _])(implicit F: Sync[F]): F[Unit] =
     F.delay(call.cancel("call was cancelled", null))
 
 }

@@ -26,14 +26,14 @@ package server
 import cats.Functor
 import cats.syntax.all._
 import cats.effect.kernel.Deferred
-import cats.effect.{Async, SyncIO}
+import cats.effect.{Async}
 import cats.effect.std.Dispatcher
 import fs2.grpc.client.StreamIngest
 import io.grpc.ServerCall
 
 private[server] class Fs2StreamServerCallListener[F[_], Request, Response] private (
     ingest: StreamIngest[F, Request],
-    signalReadiness: SyncIO[Unit],
+    signalReadiness: F[Unit],
     val isCancelled: Deferred[F, Unit],
     val call: Fs2ServerCall[F, Request, Response],
     val dispatcher: Dispatcher[F]
@@ -47,7 +47,7 @@ private[server] class Fs2StreamServerCallListener[F[_], Request, Response] priva
   override def onMessage(message: Request): Unit =
     dispatcher.unsafeRunSync(ingest.onMessage(message))
 
-  override def onReady(): Unit = signalReadiness.unsafeRunSync()
+  override def onReady(): Unit = dispatcher.unsafeRunSync(signalReadiness)
 
   override def onHalfClose(): Unit =
     dispatcher.unsafeRunSync(ingest.onClose(None))
@@ -61,7 +61,7 @@ private[server] object Fs2StreamServerCallListener {
 
     def apply[Request, Response](
         call: ServerCall[Request, Response],
-        signalReadiness: SyncIO[Unit],
+        signalReadiness: F[Unit],
         dispatcher: Dispatcher[F],
         options: ServerOptions
     )(implicit F: Async[F]): F[Fs2StreamServerCallListener[F, Request, Response]] = for {

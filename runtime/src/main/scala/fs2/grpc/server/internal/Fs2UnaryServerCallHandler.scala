@@ -21,8 +21,9 @@
 
 package fs2.grpc.server.internal
 
+import cats.syntax.all.*
 import cats.effect.std.Dispatcher
-import cats.effect.{Async, Ref, Sync, SyncIO}
+import cats.effect.{Async, Ref, Sync}
 import fs2.grpc.server.{ServerCallOptions, ServerOptions}
 import fs2.grpc.shared.StreamOutput
 import io.grpc._
@@ -31,65 +32,74 @@ private[server] object Fs2UnaryServerCallHandler {
 
   import Fs2ServerCall.Cancel
 
-  sealed trait CallerState[A]
+  sealed trait CallerState[F[_], A]
   object CallerState {
-    def init[A](cb: A => SyncIO[Cancel]): SyncIO[Ref[SyncIO, CallerState[A]]] =
-      Ref[SyncIO].of[CallerState[A]](PendingMessage(cb))
+    def init[F[_]: Sync, A](cb: A => F[Cancel]): F[Ref[F, CallerState[F, A]]] =
+      Ref[F].of[CallerState[F, A]](PendingMessage(cb))
   }
-  case class PendingMessage[A](callback: A => SyncIO[Cancel]) extends CallerState[A] {
-    def receive(a: A): PendingHalfClose[A] = PendingHalfClose(callback, a)
+  case class PendingMessage[F[_], A](callback: A => F[Cancel]) extends CallerState[F, A] {
+    def receive(a: A): PendingHalfClose[F, A] = PendingHalfClose(callback, a)
   }
-  case class PendingHalfClose[A](callback: A => SyncIO[Cancel], received: A) extends CallerState[A] {
-    def call(): SyncIO[Called[A]] = callback(received).map(Called.apply)
+  case class PendingHalfClose[F[_], A](callback: A => F[Cancel], received: A) extends CallerState[F, A] {
+    def call(): Called[F, A] = Called(callback(received))
   }
-  case class Called[A](cancel: Cancel) extends CallerState[A]
-  case class Cancelled[A]() extends CallerState[A]
+  case class Called[F[_], A](cancel: F[Cancel]) extends CallerState[F, A]
+  case class Cancelled[F[_], A]() extends CallerState[F, A]
 
-  private def mkListener[Request, Response](
+  private def mkListener[F[_]: Sync, Request, Response](
+      dispatcher: Dispatcher[F],
       call: Fs2ServerCall[Request, Response],
-      signalReadiness: SyncIO[Unit],
-      state: Ref[SyncIO, CallerState[Request]]
+      signalReadiness: F[Unit],
+      state: Ref[F, CallerState[F, Request]]
   ): ServerCall.Listener[Request] =
     new ServerCall.Listener[Request] {
       override def onCancel(): Unit =
-        state.get
-          .flatMap {
-            case Called(cancel) => cancel >> state.set(Cancelled())
-            case _ => SyncIO.unit
-          }
-          .unsafeRunSync()
+        dispatcher.unsafeRunSync(
+          state.get
+            .flatMap {
+              case Called(cancel) =>
+                cancel >> state.set(Cancelled[F, Request]())
+              case _ => Sync[F].unit
+            }
+        )
 
-      override def onMessage(message: Request): Unit =
-        state.get
-          .flatMap {
-            case s: PendingMessage[Request] =>
-              state.set(s.receive(message))
-            case _: PendingHalfClose[Request] =>
-              sendError(Status.INTERNAL.withDescription("Too many requests"))
-            case _ =>
-              SyncIO.unit
-          }
-          .unsafeRunSync()
+      override def onMessage(message: Request): Unit = {
+        dispatcher.unsafeRunSync(
+          state.get
+            .flatMap {
+              case s: PendingMessage[F, Request] =>
+                state.set(s.receive(message))
+              case _: PendingHalfClose[F, Request] =>
+                sendError(Status.INTERNAL.withDescription("Too many requests"))
+              case _ =>
+                Sync[F].unit
+            }
+        )
+      }
 
-      override def onHalfClose(): Unit =
-        state.get
-          .flatMap {
-            case s: PendingHalfClose[Request] =>
-              s.call().flatMap(state.set)
-            case _: PendingMessage[Request] =>
-              sendError(Status.INTERNAL.withDescription("Half-closed without a request"))
-            case _ =>
-              SyncIO.unit
-          }
-          .unsafeRunSync()
+      override def onHalfClose(): Unit = {
+        dispatcher.unsafeRunSync(
+          state.get
+            .flatMap {
+              case s: PendingHalfClose[F, Request] =>
+                state.set(s.call())
 
-      override def onReady(): Unit = signalReadiness.unsafeRunSync()
+              case _: PendingMessage[F, Request] =>
+                sendError(Status.INTERNAL.withDescription("Half-closed without a request"))
 
-      private def sendError(status: Status): SyncIO[Unit] =
+              case _ =>
+                Sync[F].unit
+            }
+        )
+      }
+
+      override def onReady(): Unit = dispatcher.unsafeRunSync(signalReadiness)
+
+      private def sendError(status: Status): F[Unit] =
         state.set(Cancelled()) >> call.close(status, new Metadata())
     }
 
-  def unary[F[_]: Sync, Request, Response](
+  def unary[F[_]: Async, Request, Response](
       impl: (Request, Metadata) => F[Response],
       options: ServerOptions,
       dispatcher: Dispatcher[F]
@@ -97,39 +107,43 @@ private[server] object Fs2UnaryServerCallHandler {
     new ServerCallHandler[Request, Response] {
       private val opt = options.callOptionsFn(ServerCallOptions.default)
 
-      def startCall(call: ServerCall[Request, Response], headers: Metadata): ServerCall.Listener[Request] =
-        startCallSync(call, SyncIO.unit, opt)(call => req => call.unary(impl(req, headers), dispatcher)).unsafeRunSync()
+      override def startCall(call: ServerCall[Request, Response], headers: Metadata): ServerCall.Listener[Request] =
+        dispatcher.unsafeRunSync(
+          startCallSync(dispatcher, call, Sync[F].unit, opt)(call => req => call.unary(impl(req, headers), dispatcher))
+        )
     }
 
-  def stream[F[_], Request, Response](
+  def stream[F[_]: Async, Request, Response](
       impl: (Request, Metadata) => fs2.Stream[F, Response],
       options: ServerOptions,
       dispatcher: Dispatcher[F]
-  )(implicit F: Async[F]): ServerCallHandler[Request, Response] =
+  ): ServerCallHandler[Request, Response] =
     new ServerCallHandler[Request, Response] {
       private val opt = options.callOptionsFn(ServerCallOptions.default)
 
       def startCall(call: ServerCall[Request, Response], headers: Metadata): ServerCall.Listener[Request] = {
-        val outputStream = dispatcher.unsafeRunSync(StreamOutput.server(call))
-        startCallSync(call, outputStream.onReadySync(dispatcher), opt)(call =>
-          req => {
-            call.stream(outputStream.writeStream, impl(req, headers), dispatcher)
+        dispatcher.unsafeRunSync(
+          StreamOutput.server(call).flatMap { outputStream =>
+            startCallSync(dispatcher, call, outputStream.onReady, opt) { call => req =>
+              call.stream(outputStream.writeStream, impl(req, headers), dispatcher)
+            }
           }
-        ).unsafeRunSync()
+        )
       }
     }
 
-  private def startCallSync[F[_], Request, Response](
+  private def startCallSync[F[_]: Sync, Request, Response](
+      dispatcher: Dispatcher[F],
       call: ServerCall[Request, Response],
-      signalReadiness: SyncIO[Unit],
+      signalReadiness: F[Unit],
       options: ServerCallOptions
-  )(f: Fs2ServerCall[Request, Response] => Request => SyncIO[Cancel]): SyncIO[ServerCall.Listener[Request]] = {
+  )(f: Fs2ServerCall[Request, Response] => Request => F[Cancel]): F[ServerCall.Listener[Request]] = {
     for {
       call <- Fs2ServerCall.setup(options, call)
       // We expect only 1 request, but we ask for 2 requests here so that if a misbehaving client
       // sends more than 1 requests, ServerCall will catch it.
       _ <- call.request(2)
       state <- CallerState.init(f(call))
-    } yield mkListener[Request, Response](call, signalReadiness, state)
+    } yield mkListener[F, Request, Response](dispatcher, call, signalReadiness, state)
   }
 }

@@ -21,8 +21,7 @@
 
 package fs2.grpc.shared
 
-import cats.effect.std.Dispatcher
-import cats.effect.{Async, SyncIO}
+import cats.effect.{Async}
 import cats.syntax.all._
 import fs2.Stream
 import fs2.concurrent.SignallingRef
@@ -30,8 +29,6 @@ import io.grpc.{ClientCall, ServerCall}
 
 private[grpc] trait StreamOutput[F[_], T] {
   def onReady: F[Unit]
-
-  def onReadySync(dispatcher: Dispatcher[F]): SyncIO[Unit] = SyncIO.delay(dispatcher.unsafeRunSync(onReady))
 
   def writeStream(s: Stream[F, T]): Stream[F, Nothing]
 }
